@@ -6,7 +6,6 @@ from pydantic import BaseModel
 from neo4j import GraphDatabase
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
-import chromadb
 from google import genai
 
 load_dotenv()
@@ -25,7 +24,6 @@ URI = os.getenv("NEO4J_URI")
 AUTH = (os.getenv("NEO4J_USER"), os.getenv("NEO4J_PASSWORD"))
 driver = GraphDatabase.driver(URI, auth=AUTH)
 
-# --- MODELS ---
 class TripRequest(BaseModel):
     source: str
     destinations: list[str]
@@ -33,9 +31,7 @@ class TripRequest(BaseModel):
     budget: int
     preference: str
 
-# --- GRAPH DSA FUNCTIONS ---
 def get_shortest_path(tx, source, dest):
-    """Finds the absolute cheapest path between two specific cities"""
     query = """
     MATCH path = (start:Location {name: $source})-[r:TRAVEL_ROUTE*1..3]->(end:Location {name: $dest})
     RETURN path, 
@@ -81,30 +77,26 @@ def get_destination_details(tx, destination, preference):
     record = tx.run(query, destination=destination, preference=preference).single()
     return record.data() if record else None
 
-# --- MAIN ENDPOINT ---
 @app.post("/plan-trip")
 def plan_trip(req: TripRequest):
     try:
         with driver.session() as session:
-            # 1. TSP ALGORITHM: Generate all possible orders of destinations
             possible_orders = list(itertools.permutations(req.destinations))
             best_tsp_route = None
             lowest_travel_cost = float('inf')
 
-            # Evaluate each permutation to find the cheapest logical route
             for order in possible_orders:
                 current_cost = 0
                 current_legs = []
                 valid_path = True
                 
-                # Build the sequence: Source -> Dest1 -> Dest2 -> ...
                 sequence = [req.source] + list(order)
                 
                 for i in range(len(sequence) - 1):
                     path_segment = session.execute_read(get_shortest_path, sequence[i], sequence[i+1])
                     if not path_segment:
                         valid_path = False
-                        break # No path exists between these two nodes
+                        break 
                     current_cost += path_segment["cost"]
                     current_legs.extend(path_segment["legs"])
                 
@@ -115,7 +107,6 @@ def plan_trip(req: TripRequest):
             if not best_tsp_route:
                 raise HTTPException(status_code=404, detail="Could not connect these destinations.")
 
-            # 2. BUDGET ALLOCATION FOR MULTIPLE CITIES
             remaining_budget = req.budget - lowest_travel_cost
             if remaining_budget < 0:
                 raise HTTPException(status_code=400, detail="Budget is too low just for travel!")
@@ -126,14 +117,12 @@ def plan_trip(req: TripRequest):
             trip_itinerary = []
             total_trip_cost = lowest_travel_cost
 
-            # 3. KNAPSACK ALLOCATION PER CITY
             for dest in req.destinations:
                 details = session.execute_read(get_destination_details, dest, req.preference)
                 if not details: continue
                 
                 food_cost = details["food_cost"] * days_per_city
                 
-                # Pick the cheapest hotel that fits
                 details["hotels"].sort(key=lambda x: x["cost"])
                 chosen_hotel = details["hotels"][0] if details["hotels"] else {"name": "No Hotel", "cost": 0}
                 hotel_cost = chosen_hotel["cost"] * days_per_city
@@ -172,30 +161,25 @@ def plan_trip(req: TripRequest):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- RAG ENDPOINT (POWERED BY NEW GEMINI SDK) ---
-chroma_client = chromadb.PersistentClient(path="./chroma_db")
-rag_collection = chroma_client.get_collection(name="travel_knowledge_base")
-
 @app.get("/location-info/{location_name}")
 def get_location_info(location_name: str):
-    results = rag_collection.query(query_texts=[f"Tell me about {location_name}"], n_results=1)
-    context = results['documents'][0][0] if results['documents'][0] else "No specific data found."
+    # Fetch description directly from Neo4j (No ChromaDB!)
+    query = "MATCH (l:Location {name: $name}) RETURN l.description AS desc"
+    with driver.session() as session:
+        record = session.run(query, name=location_name).single()
+        context = record["desc"] if record and record["desc"] else "No specific data found."
     
     api_key = os.getenv("GEMINI_API_KEY")
     if api_key:
         try:
             client = genai.Client(api_key=api_key)
             prompt = f"Based on this: '{context}', write a 2-sentence exciting travel pitch for {location_name}."
-            
-            response = client.models.generate_content(
-                model='gemini-3.5-flash',
-                contents=prompt
-            )
+            response = client.models.generate_content(model='gemini-1.5-flash', contents=prompt)
             ai_description = response.text
         except Exception as e:
             ai_description = f"Error connecting to Gemini: {str(e)}"
     else:
-        ai_description = f"✨ (AI Summary) ✨\n{context}\n\nYou will absolutely love exploring {location_name}!"
+        ai_description = f"✨ {context}"
 
     return {
         "name": location_name,
@@ -203,7 +187,6 @@ def get_location_info(location_name: str):
         "image_url": f"https://picsum.photos/seed/{location_name}/400/250"
     }
 
-# --- AI DAY-BY-DAY ITINERARY ENDPOINT (POWERED BY NEW GEMINI SDK) ---
 @app.post("/generate-itinerary")
 def generate_itinerary(plan: dict):
     api_key = os.getenv("GEMINI_API_KEY")
@@ -219,19 +202,16 @@ def generate_itinerary(plan: dict):
         acts = ", ".join(act_names) if act_names else "Relaxation and local sightseeing"
         prompt += f"- {city['city']} for {city['days']} days. Hotel: {city['accommodation']['name']}. Planned Activities: {acts}.\n"
 
-    prompt += "\nWrite a detailed, engaging Day-by-Day itinerary. Include realistic times (e.g., 'Morning', 'Afternoon'), check-ins, and travel times. Format the output using clean HTML (e.g., <h3>Day 1</h3>, <ul><li>...</li></ul>). Do not use markdown backticks like ```html, just return the raw HTML code."
+    prompt += "\nWrite a detailed, engaging Day-by-Day itinerary. Include realistic times (e.g., 'Morning', 'Afternoon'). Format the output using clean HTML (e.g., <h3>Day 1</h3>, <ul><li>...</li></ul>). Do not use markdown backticks, just return raw HTML."
 
     if api_key:
         try:
             client = genai.Client(api_key=api_key)
-            response = client.models.generate_content(
-                model='gemini-3.5-flash',
-                contents=prompt
-            )
+            response = client.models.generate_content(model='gemini-1.5-flash', contents=prompt)
             html_text = response.text.replace("```html", "").replace("```", "").strip()
             return {"html_itinerary": html_text}
         except Exception as e:
-            return {"html_itinerary": f"<p style='color:red;'>Error connecting to Gemini AI: {str(e)}</p>"}
+            return {"html_itinerary": f"<p style='color:red;'>Error connecting to Gemini: {str(e)}</p>"}
     else:
         return {"html_itinerary": "<p>Please add GEMINI_API_KEY to your .env file.</p>"}
 

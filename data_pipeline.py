@@ -4,7 +4,6 @@ import time
 from bs4 import BeautifulSoup
 from geopy.geocoders import Nominatim
 from neo4j import GraphDatabase
-import chromadb
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -13,9 +12,6 @@ load_dotenv()
 URI = os.getenv("NEO4J_URI")
 AUTH = (os.getenv("NEO4J_USER"), os.getenv("NEO4J_PASSWORD"))
 driver = GraphDatabase.driver(URI, auth=AUTH)
-
-chroma_client = chromadb.PersistentClient(path="./chroma_db")
-rag_collection = chroma_client.get_or_create_collection(name="travel_knowledge_base")
 
 geolocator = Nominatim(user_agent="ai_travel_planner")
 
@@ -55,14 +51,6 @@ def add_to_databases(city, state, food_cost):
     lat, lon = get_coordinates(city)
     description = scrape_wikipedia(city)
     time.sleep(1) # Be polite to APIs
-    
-    # 2. LOAD INTO CHROMADB (For RAG)
-    rag_collection.upsert(
-        documents=[description],
-        metadatas=[{"location": city}],
-        ids=[f"loc_{city.lower()}"]
-    )
-    print("Added to ChromaDB")
     
     # 3. LOAD INTO NEO4J (For Graph Routing)
     with driver.session() as session:
